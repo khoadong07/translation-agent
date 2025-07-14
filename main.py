@@ -8,14 +8,25 @@ from langgraph.graph import StateGraph, END
 import os
 import asyncio
 import httpx
+import hashlib
+import redis
+import json
 
 load_dotenv()
 
 app = FastAPI()
 
 FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
-FIREWORKS_API_URL = "https://api.fireworks.ai/inference/v1/completions"
-FIREWORKS_MODEL = "accounts/fireworks/models/qwen3-30b-a3b"
+FIREWORKS_API_URL = os.getenv("FIREWORKS_API_URL")
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+# Redis connection
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    db=0,
+    decode_responses=True
+)
 
 # Define input model
 class TranslationRequest(BaseModel):
@@ -31,59 +42,25 @@ class TranslationState(TypedDict):
 
 # Translation prompts
 PROMPTS = {
-    "jp": """以下のテキストを正確に日本語に翻訳してください。内容を追加・変更せず、100%正しい文法とスペルで翻訳してください。説明や余計な情報は不要です。翻訳結果のみを出力してください。
-    
-    {{content}}""",
-    "en": """Dịch chính xác đoạn văn sau sang tiếng Anh. Đảm bảo đúng chính tả 100%, không thêm thắt hay sáng tạo nội dung, không kèm theo lời giải thích hoặc ghi chú. Chỉ xuất kết quả là nội dung đã được dịch:
-    
-    {{content}}"""
+    "jp": """以下のテキストを日本語に正確に翻訳してください。内容を追加または変更せず、完全に正しい文法と綴りで翻訳してください。説明や余計な情報は不要で、翻訳した内容のみを出力してください。
+
+{{content}}""",
+    "en": """Translate the following text into English accurately. Ensure completely error-free spelling and grammar, without adding or altering content. Do not include explanations or notes. Output only the translated content:
+
+{{content}}"""
 }
 
-
-import httpx
-
-async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
-    headers = {
-        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "fireworks-playground": "true",  # optional
-    }
-    payload = {
-        "model": "accounts/fireworks/models/llama4-scout-instruct-basic",
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.6,
-        "top_p": 1,
-        "top_k": 40,
-        "n": 1,
-        "presence_penalty": 0,
-        "frequency_penalty": 0,
-        "stream": False,
-        "echo": False,
-        "logprobs": True
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            "https://api.fireworks.ai/inference/v1/chat/completions",
-            headers=headers,
-            json=payload
-        )
-        if response.status_code != 200:
-            raise Exception(f"Fireworks error {response.status_code}: {response.text}")
-        data = response.json()
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-
-
-import httpx
+def get_cache_key(content: str, lang: str) -> str:
+    # Create a unique key for caching
+    content_hash = hashlib.md5(content.encode()).hexdigest()
+    return f"translation:{content_hash}:{lang}"
 
 async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
     headers = {
         "Authorization": f"Bearer {FIREWORKS_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "fireworks-playground": "true",  # optional
+        "fireworks-playground": "true",
     }
     payload = {
         "model": "accounts/fireworks/models/llama4-scout-instruct-basic",
@@ -118,9 +95,18 @@ async def translate_node(state: TranslationState) -> TranslationState:
 
     async def translate_single_language(content: str, lang: str):
         try:
+            # Check Redis cache first
+            cache_key = get_cache_key(content, lang)
+            cached_result = redis_client.get(cache_key)
+            if cached_result:
+                return lang, cached_result
+
             prompt = PROMPTS[lang].replace("{{content}}", content)
             messages = [{"role": "user", "content": prompt}]
             result = await call_fireworks_chat(messages)
+            
+            # Store in Redis with 24-hour expiration
+            redis_client.setex(cache_key, 86400, result)
             return lang, result
         except Exception as e:
             return lang, str(e)

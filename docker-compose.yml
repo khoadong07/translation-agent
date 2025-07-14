@@ -13,3 +13,7 @@ services:
     restart: unless-stopped
     volumes:
       - .:/app
+  redis:
+    image: redis
+    container_name: translator-redis
+    restart: unless-stopped

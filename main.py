@@ -5,20 +5,17 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from langsmith import traceable
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
 import os
 import asyncio
+import httpx
 
 load_dotenv()
 
 app = FastAPI()
 
-# Khởi tạo mô hình LLM từ OpenRouter thông qua langchain_openai
-llm = ChatOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.getenv("OPENAI_API_KEY"),
-    model="qwen/qwen3-8b:free"
-)
+FIREWORKS_API_KEY = os.getenv("FIREWORKS_API_KEY")
+FIREWORKS_API_URL = "https://api.fireworks.ai/inference/v1/completions"
+FIREWORKS_MODEL = "accounts/fireworks/models/qwen3-30b-a3b"
 
 # Define input model
 class TranslationRequest(BaseModel):
@@ -42,6 +39,78 @@ PROMPTS = {
     {{content}}"""
 }
 
+
+import httpx
+
+async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "fireworks-playground": "true",  # optional
+    }
+    payload = {
+        "model": "accounts/fireworks/models/llama4-scout-instruct-basic",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.6,
+        "top_p": 1,
+        "top_k": 40,
+        "n": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "stream": False,
+        "echo": False,
+        "logprobs": True
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.fireworks.ai/inference/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        if response.status_code != 200:
+            raise Exception(f"Fireworks error {response.status_code}: {response.text}")
+        data = response.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+
+import httpx
+
+async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
+    headers = {
+        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "fireworks-playground": "true",  # optional
+    }
+    payload = {
+        "model": "accounts/fireworks/models/llama4-scout-instruct-basic",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 0.6,
+        "top_p": 1,
+        "top_k": 40,
+        "n": 1,
+        "presence_penalty": 0,
+        "frequency_penalty": 0,
+        "stream": False,
+        "echo": False,
+        "logprobs": True
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.fireworks.ai/inference/v1/chat/completions",
+            headers=headers,
+            json=payload
+        )
+        if response.status_code != 200:
+            raise Exception(f"Fireworks error {response.status_code}: {response.text}")
+        data = response.json()
+        return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
 @traceable(name="translate_node")
 async def translate_node(state: TranslationState) -> TranslationState:
     translations = {}
@@ -50,8 +119,9 @@ async def translate_node(state: TranslationState) -> TranslationState:
     async def translate_single_language(content: str, lang: str):
         try:
             prompt = PROMPTS[lang].replace("{{content}}", content)
-            response = await asyncio.to_thread(llm.invoke, prompt)
-            return lang, response.content
+            messages = [{"role": "user", "content": prompt}]
+            result = await call_fireworks_chat(messages)
+            return lang, result
         except Exception as e:
             return lang, str(e)
 
@@ -63,7 +133,7 @@ async def translate_node(state: TranslationState) -> TranslationState:
             errors.append(f"Unexpected error: {str(result)}")
         else:
             lang, output = result
-            if isinstance(output, str) and output.lower().startswith("error"):
+            if "error" in output.lower():
                 errors.append(f"Translation failed for {lang}: {output}")
             else:
                 translations[lang] = output

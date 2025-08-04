@@ -45,9 +45,7 @@ PROMPTS = {
     "jp": """以下のテキストを日本語に正確に翻訳してください。内容を追加または変更せず、完全に正しい文法と綴りで翻訳してください。説明や余計な情報は不要で、翻訳した内容のみを出力してください。
 
 {{content}}""",
-    "en": """Translate the following text into English accurately. Ensure completely error-free spelling and grammar, without adding or altering content. Do not include explanations or notes. Output only the translated content:
-
-{{content}}"""
+    "en": """Translate the text below into English. Only output the translated content. Do not explain or add anything.\n\n{{content}}"""
 }
 
 def get_cache_key(content: str, lang: str) -> str:

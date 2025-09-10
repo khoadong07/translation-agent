@@ -55,13 +55,13 @@ def get_cache_key(content: str, lang: str) -> str:
 
 async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
     headers = {
-        "Authorization": f"Bearer {FIREWORKS_API_KEY}",
+        # "Authorization": f"Bearer {FIREWORKS_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
         "fireworks-playground": "true",
     }
     payload = {
-        "model": "accounts/fireworks/models/llama4-scout-instruct-basic",
+        "model": "unsloth/Qwen2.5-7B-Instruct",
         "messages": messages,
         "max_tokens": 4096,
         "temperature": 0.6,
@@ -77,7 +77,7 @@ async def call_fireworks_chat(messages: List[Dict[str, str]]) -> str:
 
     async with httpx.AsyncClient(timeout=30) as client:
         response = await client.post(
-            "https://api.fireworks.ai/inference/v1/chat/completions",
+            os.getenv("LLM_URL", ""),
             headers=headers,
             json=payload
         )

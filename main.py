@@ -1,3 +1,4 @@
+import datetime
 import os
 import asyncio
 import hashlib
@@ -73,6 +74,7 @@ async def call_chat(messages: List[Dict[str, str]]) -> str:
     client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     try:
         logger.info("Calling OpenAI...")
+        start_time = datetime.datetime.now()
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages,
@@ -84,7 +86,7 @@ async def call_chat(messages: List[Dict[str, str]]) -> str:
             frequency_penalty=0,
         )
         content = response.choices[0].message.content.strip()
-        logger.info("Received response from OpenAI")
+        logger.info(f"Received response from OpenAI in {datetime.datetime.now() - start_time}s")
         return content
     except Exception as openai_error:
         logger.warning(f"OpenAI failed: {openai_error}, fallback to Local LLM")

@@ -68,6 +68,61 @@ def get_cache_key(content: str, lang: str) -> str:
     logger.debug(f"Generated cache key: {key}")
     return key
 
+async def call_chat(messages: List[Dict[str, str]]) -> str:
+    # Ưu tiên OpenAI trước
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+    try:
+        logger.info("Calling OpenAI...")
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.6,
+            top_p=1,
+            n=1,
+            presence_penalty=0,
+            frequency_penalty=0,
+        )
+        content = response.choices[0].message.content.strip()
+        logger.info("Received response from OpenAI")
+        return content
+    except Exception as openai_error:
+        logger.warning(f"OpenAI failed: {openai_error}, fallback to Local LLM")
+
+        # Fallback sang Local
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "Local-playground": "true",
+        }
+        payload = {
+            "model": "unsloth/Qwen2.5-7B-Instruct",
+            "messages": messages,
+            "max_tokens": 4096,
+            "temperature": 0.6,
+            "top_p": 1,
+            "top_k": 40,
+            "n": 1,
+            "presence_penalty": 0,
+            "frequency_penalty": 0,
+            "stream": False,
+            "echo": False,
+            "logprobs": True
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=12) as client:
+                response = await client.post(LLM_URL, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                logger.info("Received response from Local LLM fallback")
+                return content
+        except Exception as local_error:
+            logger.error(f"Local LLM fallback failed: {local_error}")
+            raise Exception(f"Translation failed: {str(local_error)}")
+
+
 async def call_Local_chat(messages: List[Dict[str, str]]) -> str:
     headers = {
         "Content-Type": "application/json",
@@ -130,7 +185,7 @@ async def translate_single_language(content: str, lang: str) -> (str, str):
     prompt = PROMPTS[lang].replace("{{content}}", content)
     messages = [{"role": "user", "content": prompt}]
     try:
-        result = await call_Local_chat(messages)
+        result = await call_chat(messages)
         redis_client.setex(cache_key, 86400, result)
         logger.info(f"Stored translation in cache for '{lang}'")
         return lang, result

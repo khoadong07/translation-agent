@@ -5,7 +5,6 @@ import hashlib
 import logging
 from typing import TypedDict, Dict, List
 
-import httpx
 import redis
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
@@ -13,20 +12,57 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from langsmith import traceable
-from langgraph.graph import StateGraph, END
 
 load_dotenv()
 
 # -----------------------------
 # Config & Redis
 # -----------------------------
-Local_API_KEY = os.getenv("Local_API_KEY")
-LLM_URL = os.getenv("LLM_URL", "")
 OPENAI_API_KEY = os.getenv("OPEN_AI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPEN_AI_API_KEY is required")
+
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 
 redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+
+# -----------------------------
+# Rate Limiting for OpenAI (300 req/min = 5 req/sec)
+# We'll enforce min 200ms between requests → max 5 req/sec
+# -----------------------------
+last_call_time = 0.0
+rate_limit_lock = asyncio.Lock()
+MIN_INTERVAL = 0.2  # 200ms → 5 requests per second (safe under 300/min)
+
+async def rate_limited_openai_call(messages: List[Dict[str, str]]) -> str:
+    global last_call_time
+    async with rate_limit_lock:
+        now = asyncio.get_event_loop().time()
+        elapsed = now - last_call_time
+        if elapsed < MIN_INTERVAL:
+            sleep_time = MIN_INTERVAL - elapsed
+            await asyncio.sleep(sleep_time)
+            now = asyncio.get_event_loop().time()
+        last_call_time = now
+
+        # Now safe to call OpenAI
+        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+        logger.info("Calling OpenAI (rate-limited)...")
+        start_time = datetime.datetime.now()
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=4096,
+            temperature=0.6,
+            top_p=1,
+            n=1,
+            presence_penalty=0,
+            frequency_penalty=0,
+        )
+        content = response.choices[0].message.content.strip()
+        logger.info(f"OpenAI response received in {datetime.datetime.now() - start_time}")
+        return content
 
 # -----------------------------
 # Logging
@@ -51,7 +87,7 @@ class TranslationState(TypedDict):
     errors: List[str]
 
 # -----------------------------
-# Translation prompts
+# Translation prompts (unchanged)
 # -----------------------------
 PROMPTS = {
     "jp": """以下のテキストを日本語に正確に翻訳してください。内容を追加または変更せず、完全に正しい文法と綴りで翻訳してください。説明や余計な情報は不要で、翻訳した内容のみを出力してください。
@@ -69,113 +105,6 @@ def get_cache_key(content: str, lang: str) -> str:
     logger.debug(f"Generated cache key: {key}")
     return key
 
-async def call_chat(messages: List[Dict[str, str]]) -> str:
-    # Ưu tiên OpenAI trước
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    try:
-        logger.info("Calling OpenAI...")
-        start_time = datetime.datetime.now()
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=4096,
-            temperature=0.6,
-            top_p=1,
-            n=1,
-            presence_penalty=0,
-            frequency_penalty=0,
-        )
-        content = response.choices[0].message.content.strip()
-        logger.info(f"Received response from OpenAI in {datetime.datetime.now() - start_time}s")
-        return content
-    except Exception as openai_error:
-        logger.warning(f"OpenAI failed: {openai_error}, fallback to Local LLM")
-
-        # Fallback sang Local
-        headers = {
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Local-playground": "true",
-        }
-        payload = {
-            "model": "unsloth/Qwen2.5-7B-Instruct",
-            "messages": messages,
-            "max_tokens": 4096,
-            "temperature": 0.6,
-            "top_p": 1,
-            "top_k": 40,
-            "n": 1,
-            "presence_penalty": 0,
-            "frequency_penalty": 0,
-            "stream": False,
-            "echo": False,
-            "logprobs": True
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=12) as client:
-                response = await client.post(LLM_URL, headers=headers, json=payload)
-                response.raise_for_status()
-                data = response.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-                logger.info("Received response from Local LLM fallback")
-                return content
-        except Exception as local_error:
-            logger.error(f"Local LLM fallback failed: {local_error}")
-            raise Exception(f"Translation failed: {str(local_error)}")
-
-
-async def call_Local_chat(messages: List[Dict[str, str]]) -> str:
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Local-playground": "true",
-    }
-    payload = {
-        "model": "unsloth/Qwen2.5-7B-Instruct",
-        "messages": messages,
-        "max_tokens": 4096,
-        "temperature": 0.6,
-        "top_p": 1,
-        "top_k": 40,
-        "n": 1,
-        "presence_penalty": 0,
-        "frequency_penalty": 0,
-        "stream": False,
-        "echo": False,
-        "logprobs": True
-    }
-
-    try:
-        logger.info("Calling Local LLM...")
-        async with httpx.AsyncClient(timeout=12) as client:
-            response = await client.post(LLM_URL, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-            logger.info("Received response from Local LLM")
-            return content
-    except Exception as e:
-        logger.warning(f"Local LLM failed: {e}, fallback to OpenAI")
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY) 
-        try:
-            response = await client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=messages,
-                max_tokens=4096,
-                temperature=0.6,
-                top_p=1,
-                n=1,
-                presence_penalty=0,
-                frequency_penalty=0,
-            )
-            content = response.choices[0].message.content.strip()
-            logger.info("Received response from OpenAI fallback")
-            return content
-        except Exception as openai_error:
-            logger.error(f"OpenAI fallback failed: {openai_error}")
-            raise Exception(f"OpenAI error: {str(openai_error)}")
-
 async def translate_single_language(content: str, lang: str) -> (str, str):
     cache_key = get_cache_key(content, lang)
     cached = redis_client.get(cache_key)
@@ -187,8 +116,8 @@ async def translate_single_language(content: str, lang: str) -> (str, str):
     prompt = PROMPTS[lang].replace("{{content}}", content)
     messages = [{"role": "user", "content": prompt}]
     try:
-        result = await call_chat(messages)
-        redis_client.setex(cache_key, 86400, result)
+        result = await rate_limited_openai_call(messages)
+        redis_client.setex(cache_key, 86400, result)  # cache 24h
         logger.info(f"Stored translation in cache for '{lang}'")
         return lang, result
     except Exception as e:
@@ -196,48 +125,7 @@ async def translate_single_language(content: str, lang: str) -> (str, str):
         return lang, str(e)
 
 # -----------------------------
-# Translation workflow
-# -----------------------------
-@traceable(name="translate_node")
-async def translate_node(state: TranslationState) -> TranslationState:
-    translations = {}
-    errors = []
-
-    logger.info(f"Translating content into languages: {state['languages']}")
-    tasks = [translate_single_language(state["content"], lang) for lang in state["languages"]]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    for res in results:
-        if isinstance(res, Exception):
-            logger.error(f"Unexpected error during translation: {res}")
-            errors.append(f"Unexpected error: {res}")
-        else:
-            lang, output = res
-            if "error" in output.lower():
-                logger.error(f"Translation error for '{lang}': {output}")
-                errors.append(f"Translation failed for {lang}: {output}")
-            else:
-                translations[lang] = output
-                logger.info(f"Translation successful for '{lang}'")
-
-    return {
-        "content": state["content"],
-        "languages": state["languages"],
-        "translations": translations,
-        "errors": errors
-    }
-
-def build_workflow():
-    workflow = StateGraph(TranslationState)
-    workflow.add_node("translate", translate_node)
-    workflow.set_entry_point("translate")
-    workflow.add_edge("translate", END)
-    return workflow.compile()
-
-graph = build_workflow()
-
-# -----------------------------
-# FastAPI endpoints
+# FastAPI endpoint (no LangGraph needed for single step)
 # -----------------------------
 app = FastAPI()
 
@@ -251,18 +139,26 @@ async def translate_text(request: TranslationRequest):
             logger.warning(f"Unsupported language requested: {lang}")
             raise HTTPException(status_code=400, detail=f"Unsupported language: {lang}")
 
-    initial_state: TranslationState = {
-        "content": request.content,
-        "languages": request.language,
-        "translations": {},
-        "errors": []
-    }
+    # Run all translations concurrently (but rate-limited internally)
+    tasks = [translate_single_language(request.content, lang) for lang in request.language]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    result = await graph.ainvoke(initial_state)
+    translations = {}
+    errors = []
 
-    if result["errors"]:
-        logger.error(f"Errors during translation: {result['errors']}")
-        raise HTTPException(status_code=500, detail="; ".join(result["errors"]))
+    for res in results:
+        if isinstance(res, Exception):
+            errors.append(f"Unexpected error: {res}")
+        else:
+            lang, output = res
+            if "error" in output.lower():
+                errors.append(f"Translation failed for {lang}: {output}")
+            else:
+                translations[lang] = output
 
-    logger.info(f"Translation completed successfully for languages: {list(result['translations'].keys())}")
-    return JSONResponse(content={"translations": result["translations"]})
+    if errors:
+        logger.error(f"Errors during translation: {errors}")
+        raise HTTPException(status_code=500, detail="; ".join(errors))
+
+    logger.info(f"Translation completed for: {list(translations.keys())}")
+    return JSONResponse(content={"translations": translations})

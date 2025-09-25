@@ -35,6 +35,9 @@ last_call_time = 0.0
 rate_limit_lock = asyncio.Lock()
 MIN_INTERVAL = 0.2  # 200ms → 5 requests per second (safe under 300/min)
 
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
 async def rate_limited_openai_call(messages: List[Dict[str, str]]) -> str:
     global last_call_time
     async with rate_limit_lock:
@@ -47,7 +50,6 @@ async def rate_limited_openai_call(messages: List[Dict[str, str]]) -> str:
         last_call_time = now
 
         # Now safe to call OpenAI
-        client = AsyncOpenAI(api_key=OPENAI_API_KEY)
         logger.info("Calling OpenAI (rate-limited)...")
         start_time = datetime.datetime.now()
         response = await client.chat.completions.create(

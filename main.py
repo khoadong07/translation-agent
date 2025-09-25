@@ -1,95 +1,42 @@
-import datetime
 import os
 import asyncio
 import hashlib
 import logging
-from typing import TypedDict, Dict, List
+import datetime
+from typing import Dict, List, Tuple
 
-import redis
-from openai import AsyncOpenAI
-from dotenv import load_dotenv
+import redis.asyncio as aioredis
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from langsmith import traceable
+from openai import AsyncOpenAI
+from dotenv import load_dotenv
 
+# -----------------------------
+# Load env
+# -----------------------------
 load_dotenv()
 
-# -----------------------------
-# Config & Redis
-# -----------------------------
 OPENAI_API_KEY = os.getenv("OPEN_AI_API_KEY")
 if not OPENAI_API_KEY:
     raise ValueError("OPEN_AI_API_KEY is required")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+RATE_LIMIT = 300
+WINDOW_SIZE = 60  # 60s = 1 phút
 
-redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-
-# -----------------------------
-# Rate Limiting for OpenAI (300 req/min = 5 req/sec)
-# We'll enforce min 200ms between requests → max 5 req/sec
-# -----------------------------
-last_call_time = 0.0
-rate_limit_lock = asyncio.Lock()
-MIN_INTERVAL = 0.2  # 200ms → 5 requests per second (safe under 300/min)
-
-
+redis_client = aioredis.Redis(host=REDIS_HOST, port=REDIS_PORT, decode_responses=True)
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-
-async def rate_limited_openai_call(messages: List[Dict[str, str]]) -> str:
-    global last_call_time
-    async with rate_limit_lock:
-        now = asyncio.get_event_loop().time()
-        elapsed = now - last_call_time
-        if elapsed < MIN_INTERVAL:
-            sleep_time = MIN_INTERVAL - elapsed
-            await asyncio.sleep(sleep_time)
-            now = asyncio.get_event_loop().time()
-        last_call_time = now
-
-        # Now safe to call OpenAI
-        logger.info("Calling OpenAI (rate-limited)...")
-        start_time = datetime.datetime.now()
-        response = await client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            max_tokens=4096,
-            temperature=0.6,
-            top_p=1,
-            n=1,
-            presence_penalty=0,
-            frequency_penalty=0,
-        )
-        content = response.choices[0].message.content.strip()
-        logger.info(f"OpenAI response received in {datetime.datetime.now() - start_time}")
-        return content
 
 # -----------------------------
 # Logging
 # -----------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 # -----------------------------
-# Models
-# -----------------------------
-class TranslationRequest(BaseModel):
-    language: List[str]
-    content: str
-
-class TranslationState(TypedDict):
-    content: str
-    languages: List[str]
-    translations: Dict[str, str]
-    errors: List[str]
-
-# -----------------------------
-# Translation prompts (unchanged)
+# Translation prompts
 # -----------------------------
 PROMPTS = {
     "jp": """以下のテキストを日本語に正確に翻訳してください。内容を追加または変更せず、完全に正しい文法と綴りで翻訳してください。説明や余計な情報は不要で、翻訳した内容のみを出力してください。
@@ -99,68 +46,106 @@ PROMPTS = {
 }
 
 # -----------------------------
-# Helper functions
+# Models
+# -----------------------------
+class TranslationRequest(BaseModel):
+    language: List[str]
+    content: str
+
+# -----------------------------
+# Rate limit (Redis counter)
+# -----------------------------
+async def acquire_token():
+    """Check and consume token in Redis bucket (300/min)"""
+    key = f"translation:rate_limit:{int(datetime.datetime.utcnow().timestamp() // WINDOW_SIZE)}"
+    count = await redis_client.incr(key)
+    if count == 1:
+        await redis_client.expire(key, WINDOW_SIZE)
+    if count > RATE_LIMIT:
+        return False
+    return True
+
+# -----------------------------
+# Cache helpers
 # -----------------------------
 def get_cache_key(content: str, lang: str) -> str:
     content_hash = hashlib.md5(content.encode()).hexdigest()
-    key = f"translation:{content_hash}:{lang}"
-    logger.debug(f"Generated cache key: {key}")
-    return key
+    return f"translation:{content_hash}:{lang}"
 
-async def translate_single_language(content: str, lang: str) -> (str, str):
-    cache_key = get_cache_key(content, lang)
-    cached = redis_client.get(cache_key)
-    if cached:
-        logger.info(f"Cache hit for language '{lang}'")
-        return lang, cached
+async def get_cached_translation(content: str, lang: str):
+    key = get_cache_key(content, lang)
+    return await redis_client.get(key)
 
-    logger.info(f"Cache miss for language '{lang}', translating...")
-    prompt = PROMPTS[lang].replace("{{content}}", content)
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        result = await rate_limited_openai_call(messages)
-        redis_client.setex(cache_key, 86400, result)  # cache 24h
-        logger.info(f"Stored translation in cache for '{lang}'")
-        return lang, result
-    except Exception as e:
-        logger.error(f"Translation failed for '{lang}': {e}")
-        return lang, str(e)
+async def set_cached_translation(content: str, lang: str, translation: str):
+    key = get_cache_key(content, lang)
+    await redis_client.setex(key, 86400, translation)  # TTL 24h
 
 # -----------------------------
-# FastAPI endpoint (no LangGraph needed for single step)
+# OpenAI call per language
+# -----------------------------
+async def translate_single_language(content: str, lang: str) -> Tuple[str, str]:
+    # Check cache
+    cached = await get_cached_translation(content, lang)
+    if cached:
+        logger.info(f"Cache hit for {lang}")
+        return lang, cached
+
+    # Check rate limit
+    allowed = await acquire_token()
+    if not allowed:
+        raise HTTPException(status_code=429, detail="Rate limit exceeded (300 req/min)")
+
+    logger.info(f"Translating to {lang}...")
+    prompt = PROMPTS[lang].replace("{{content}}", content)
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=messages,
+            max_tokens=1024,
+            temperature=0.6,
+        )
+        result = response.choices[0].message.content.strip()
+        await set_cached_translation(content, lang, result)
+        return lang, result
+    except Exception as e:
+        logger.error(f"OpenAI translation error for {lang}: {e}")
+        return lang, f"Error: {str(e)}"
+
+# -----------------------------
+# FastAPI app
 # -----------------------------
 app = FastAPI()
 
-@traceable(name="translate_text_endpoint")
 @app.post("/translate")
 async def translate_text(request: TranslationRequest):
-    logger.info(f"Received translation request: languages={request.language}")
-    valid_languages = ["jp", "en"]
+    logger.info(f"Received request for {request.language}")
+
+    # validate languages
+    valid_languages = list(PROMPTS.keys())
     for lang in request.language:
         if lang not in valid_languages:
-            logger.warning(f"Unsupported language requested: {lang}")
             raise HTTPException(status_code=400, detail=f"Unsupported language: {lang}")
 
-    # Run all translations concurrently (but rate-limited internally)
+    # run concurrently
     tasks = [translate_single_language(request.content, lang) for lang in request.language]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    translations = {}
-    errors = []
+    translations: Dict[str, str] = {}
+    errors: List[str] = []
 
-    for res in results:
+    for lang, res in zip(request.language, results):
         if isinstance(res, Exception):
-            errors.append(f"Unexpected error: {res}")
+            errors.append(f"{lang}: {res}")
         else:
-            lang, output = res
-            if "error" in output.lower():
-                errors.append(f"Translation failed for {lang}: {output}")
+            l, output = res
+            if output.lower().startswith("error"):
+                errors.append(f"{l}: {output}")
             else:
-                translations[lang] = output
+                translations[l] = output
 
     if errors:
-        logger.error(f"Errors during translation: {errors}")
         raise HTTPException(status_code=500, detail="; ".join(errors))
 
-    logger.info(f"Translation completed for: {list(translations.keys())}")
     return JSONResponse(content={"translations": translations})
